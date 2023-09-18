@@ -1,14 +1,23 @@
-// TODO: Force the ExprProxy to impl Deref<ExprRaw>, and also have VarProxy which impls Deref<VarRaw> which then impls Deref<Expr>.
-
-use std::marker::{PhantomData, PhantomPinned};
-use std::mem::MaybeUninit;
+use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::atomic::AtomicUsize;
+
+static NEXT_NODE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy)]
-pub struct NodeRef;
+pub struct NodeRef(usize);
+impl NodeRef {
+    pub fn new() -> Self {
+        NodeRef(NEXT_NODE.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
 
 pub trait Tracked {
     type Type: TrackingType;
+    type Value: Value;
+}
+pub trait FromNode {
+    fn from_node(node: NodeRef) -> Self;
 }
 pub trait TrackingType {}
 pub struct ValueType;
@@ -18,88 +27,156 @@ impl TrackingType for ExprType {}
 pub struct VarType;
 impl TrackingType for VarType {}
 
-pub trait Value: Copy + Tracked<Type = ValueType> + 'static {
-    type Expr<'a>: ExprProxy<'a, Value = Self>;
-    // type Var: VarProxy<Value = Self>;
+impl<T: Value> Tracked for T {
+    type Type = ValueType;
+    type Value = T;
 }
-pub trait ExprProxy<'a>: Copy + 'a {
-    type Value: Value<Expr<'a> = Self>;
-    fn _wrap(expr: &'a Expr<'a, Self::Value>) -> Self;
-}
-// pub trait VarProxy: Copy {
-//     type Value: Value<Var = Self>;
-//     fn _wrap(var: &Var<Self::Value>) -> Self;
-// }
 
-// #[derive(Clone, Copy, Debug)]
-// pub struct ExprRaw<T: Value> {
-//     pub(crate) node: NodeRef,
-//     _phantom: PhantomData<T>,
-// }
+pub trait AsExpr: Tracked {
+    fn as_expr(&self) -> Expr<Self::Value>;
+}
+
+impl<T: Value> AsExpr for T {
+    fn as_expr(&self) -> Expr<Self::Value> {
+        Expr::from_node(NodeRef(0))
+    }
+}
+impl<T: Value> AsExpr for Var<T> {
+    fn as_expr(&self) -> Expr<T> {
+        Expr::from_node(self.node)
+    }
+}
+impl<T: Value> AsExpr for Expr<T> {
+    fn as_expr(&self) -> Expr<T> {
+        *self
+    }
+}
+
+pub trait Value: Copy + 'static {
+    type Expr: ExprProxy<Value = Self>;
+    type Var: VarProxy<Value = Self>;
+    type ExprData: Copy + FromNode + 'static;
+    type VarData: Copy + FromNode + 'static;
+}
+pub unsafe trait HasExprLayout<X: Copy + FromNode> {}
+pub unsafe trait HasVarLayout<X: Copy + FromNode> {}
+pub trait ExprProxy: Copy + HasExprLayout<<Self::Value as Value>::ExprData> + 'static {
+    type Value: Value<Expr = Self>;
+}
+pub trait VarProxy:
+    Copy + HasVarLayout<<Self::Value as Value>::VarData> + Deref<Target = Expr<Self::Value>> + 'static
+{
+    type Value: Value<Var = Self>;
+}
 
 #[derive(Clone, Copy, Debug)]
-pub struct Expr<'a, T: Value> {
+#[repr(C)]
+pub struct Expr<T: Value> {
     node: NodeRef,
-    _phantom: PhantomData<(T, &'a ())>,
-    _pin: PhantomPinned,
-    proxy: T::Expr<'a>,
+    _phantom: PhantomData<T>,
+    data: T::ExprData,
 }
-impl<T: Value> Tracked for Expr<'_, T> {
+impl<T: Value> Tracked for Expr<T> {
     type Type = ExprType;
+    type Value = T;
 }
-impl<'a, T: Value> Expr<'a, T> {
-    pub fn from_node(node: NodeRef) -> Self {
-        let mut res: Expr<'a, T> = Expr {
+impl<T: Value> Deref for Expr<T> {
+    type Target = T::Expr;
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+impl<T: Value> FromNode for Expr<T> {
+    fn from_node(node: NodeRef) -> Self {
+        Expr {
             node,
             _phantom: PhantomData,
-            _pin: PhantomPinned,
-            proxy: unsafe { MaybeUninit::uninit().assume_init() },
-        };
-        let proxy = T::Expr::_wrap(unsafe { std::mem::transmute::<_, &'a Expr<'a, T>>(&res) });
-        res.proxy = proxy;
-        res
+            data: T::ExprData::from_node(node),
+        }
+    }
+}
+impl<T: Value> Expr<T> {
+    pub fn from_proxy(proxy: &T::Var) -> &Self {
+        unsafe { std::mem::transmute(proxy) }
     }
     pub fn print_node(&self) {
         println!("{:?}", self.node);
     }
 }
 
-impl<'a, T: Value> Deref for Expr<'a, T> {
-    type Target = T::Expr<'a>;
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Var<T: Value> {
+    node: NodeRef,
+    _phantom: PhantomData<T>,
+    data: T::VarData,
+}
+impl<T: Value> Tracked for Var<T> {
+    type Type = VarType;
+    type Value = T;
+}
+impl<T: Value> Deref for Var<T> {
+    type Target = T::Var;
     fn deref(&self) -> &Self::Target {
-        &self.proxy
+        unsafe { std::mem::transmute(self) }
+    }
+}
+impl<T: Value> FromNode for Var<T> {
+    fn from_node(node: NodeRef) -> Self {
+        Var {
+            node,
+            _phantom: PhantomData,
+            data: T::VarData::from_node(node),
+        }
+    }
+}
+impl<T: Value> Var<T> {
+    pub fn print_node(&self) {
+        println!("{:?}", self.node);
+    }
+    pub fn from_proxy(proxy: &T::Var) -> &Self {
+        unsafe { std::mem::transmute(proxy) }
+    }
+    pub fn _deref(&self) -> &Expr<T> {
+        todo!();
     }
 }
 
-impl Tracked for f32 {
-    type Type = ValueType;
+impl<T: Default> FromNode for T {
+    fn from_node(_node: NodeRef) -> Self {
+        Self::default()
+    }
 }
+
+#[derive(Debug, Copy, Clone)]
+#[repr(transparent)]
+pub struct DefaultVarProxy<T: Value<VarData = ()>>(Var<T>);
+unsafe impl<T: Value<VarData = ()>> HasVarLayout<()> for DefaultVarProxy<T> {}
+impl<T: Value<VarData = ()>> Deref for DefaultVarProxy<T> {
+    type Target = Expr<T>;
+    fn deref(&self) -> &Self::Target {
+        self.0._deref()
+    }
+}
+impl<T: Value<VarData = (), Var = DefaultVarProxy<T>>> VarProxy for DefaultVarProxy<T> {
+    type Value = T;
+}
+
 impl Value for f32 {
-    type Expr<'a> = F32ExprProxy<'a>;
+    type Expr = F32ExprProxy;
+    type Var = DefaultVarProxy<Self>;
+    type ExprData = ();
+    type VarData = ();
 }
 #[derive(Debug, Copy, Clone)]
-pub struct F32ExprProxy<'a>(&'a Expr<'a, f32>);
-impl<'a> ExprProxy<'a> for F32ExprProxy<'a> {
+#[repr(transparent)]
+pub struct F32ExprProxy(Expr<f32>);
+unsafe impl HasExprLayout<()> for F32ExprProxy {}
+impl ExprProxy for F32ExprProxy {
     type Value = f32;
-    fn _wrap(expr: &'a Expr<'a, Self::Value>) -> Self {
-        F32ExprProxy(expr)
+}
+impl F32ExprProxy {
+    pub fn do_float_thing(&self) {
+        println!("Doing float thing");
     }
 }
-impl F32ExprProxy<'_> {
-    pub fn do_thing(&self) {
-        println!("Hi!");
-    }
-}
-/*
-#[derive(Clone, Copy, Debug)]
-pub struct Var<T: Value> {
-    pub(crate) node: NodeRef,
-    _phantom: PhantomData<T>,
-    proxy: T::Var,
-}
-
-impl<T: Value> Deref for Var<T> {
-    type Target = Expr<T>;
-    fn deref(&self) -> &Self::Target {}
-}
-*/
